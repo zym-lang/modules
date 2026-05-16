@@ -1,0 +1,2 @@
+func test() { print("PKG Test") }
+return { test }
