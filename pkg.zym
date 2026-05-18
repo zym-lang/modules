@@ -1,2 +1,456 @@
-func test() { print("PKG Test") }
-return { test }
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Anatole DP
+
+var RUNNING_BINARY_PATH
+var RUNNING_BINARY_PLATFORM
+var MODULE_PATH = Path.join(System.dataDir(), "zym", "modules")
+
+var RAW_GITHUB  = "raw.githubusercontent.com"
+var RAW_GITLAB  = "gitlab.com"
+var ZYM_OWNER   = "zym-lang"
+var ZYM_REPO    = "modules"
+var ZYM_BRANCH  = "main"
+
+func tlsGet(host, path, timeoutMs)
+{
+    var request = "GET " + path + " HTTP/1.1\r\n" +
+                  "Host: " + host + "\r\n" +
+                  "User-Agent: zym-pkg\r\n" +
+                  "Connection: close\r\n" +
+                  "\r\n"
+
+    var s = TLS.connect(host, 443, timeoutMs)
+    if (s == null) { return { ok: false, status: 0, error: "Failed to connect to " + host } }
+
+    s.write(Buffer.fromString(request), timeoutMs)
+
+    var statusLine = s.readLine(timeoutMs)
+    if (typeof(statusLine) != "string") {
+        s.close()
+        return { ok: false, status: 0, error: "Failed to read status line" }
+    }
+
+    var statusCode = 0
+    if (startsWith(statusLine, "HTTP/")) {
+        var parts = split(statusLine, " ")
+        if (length(parts) >= 2) { statusCode = num(parts[1]) }
+    }
+
+    while (true) {
+        var line = s.readLine(timeoutMs)
+        if (typeof(line) != "string" || line == "") { break }
+    }
+
+    if (statusCode != 200) {
+        s.close()
+        return { ok: false, status: statusCode, error: "HTTP " + str(statusCode) }
+    }
+
+    var body = s.readAll(timeoutMs)
+    s.close()
+
+    if (typeof(body) == "string") {
+        return { ok: false, status: statusCode, error: "Failed to read body: " + body }
+    }
+
+    return { ok: true, status: statusCode, data: body }
+}
+
+func githubPath(owner, repo, ref, filePath)
+{
+    return "/" + owner + "/" + repo + "/" + ref + "/" + filePath
+}
+
+func gitlabPath(owner, repo, ref, filePath)
+{
+    return "/" + owner + "/" + repo + "/-/raw/" + ref + "/" + filePath
+}
+
+// ---------------------------------------------------------------------------
+// Package spec parsing
+// ---------------------------------------------------------------------------
+// Returns: { kind, name, owner, repo, ref, refIsTag }
+//   kind: "official" | "github" | "gitlab"
+
+func parsePackageSpec(spec)
+{
+    if (startsWith(spec, "github:") || startsWith(spec, "gitlab:")) {
+        var isGitLab = startsWith(spec, "gitlab:")
+        var rest = slice(spec, isGitLab ? length("gitlab:") : length("github:"), length(spec))
+
+        var ref = "main"
+        var refIsTag = false
+        var atIdx = indexOf(rest, "@")
+        if (atIdx > -1) {
+            ref = slice(rest, atIdx + 1, length(rest))
+            rest = slice(rest, 0, atIdx)
+            refIsTag = true
+        }
+
+        var slashIdx = indexOf(rest, "/")
+        if (slashIdx == -1) { return { error: "Invalid package spec, expected 'github:user/repo' or 'gitlab:user/repo'" } }
+
+        var owner = slice(rest, 0, slashIdx)
+        var repo  = slice(rest, slashIdx + 1, length(rest))
+        if (length(owner) == 0 || length(repo) == 0) { return { error: "Invalid package spec, user or repo is empty" } }
+
+        return {
+            kind:     isGitLab ? "gitlab" : "github",
+            name:     owner + "/" + repo,
+            owner:    owner,
+            repo:     repo,
+            ref:      ref,
+            refIsTag: refIsTag,
+        }
+    }
+
+    if (contains(spec, "/") || contains(spec, ":")) { return { error: "Unknown package spec format: '" + spec + "'" } }
+    if (contains(spec, "@")) { return { error: "Official modules do not support version tags. Use 'github:user/repo@tag' for versioned third-party packages." } }
+
+    return {
+        kind:     "official",
+        name:     spec,
+        owner:    ZYM_OWNER,
+        repo:     ZYM_REPO,
+        ref:      ZYM_BRANCH,
+        refIsTag: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch candidates
+// ---------------------------------------------------------------------------
+// Returns ordered list of { ref, zpkPath, zymPath, zymFolderPath } to try.
+// Official modules come from the zym-lang/modules monorepo on main only.
+// Third party tries main then master (or just the tag if versioned).
+
+func fetchCandidates(parsed)
+{
+    var candidates = []
+
+    if (parsed.kind == "official") {
+        push(candidates, {
+            ref:     ZYM_BRANCH,
+            zpkPath: "dist/" + parsed.name + ".zpk",
+            zymPath: parsed.name + ".zym",
+        })
+        return candidates
+    }
+
+    if (parsed.refIsTag) {
+        push(candidates, {
+            ref:     parsed.ref,
+            zpkPath: "dist/" + parsed.repo + ".zpk",
+            zymPath: parsed.repo + ".zym",
+        })
+    } else {
+        push(candidates, { ref: "main",   zpkPath: "dist/" + parsed.repo + ".zpk", zymPath: parsed.repo + ".zym" })
+        push(candidates, { ref: "master", zpkPath: "dist/" + parsed.repo + ".zpk", zymPath: parsed.repo + ".zym" })
+    }
+
+    return candidates
+}
+
+// ---------------------------------------------------------------------------
+// Install path helpers
+// ---------------------------------------------------------------------------
+// destDir  — parent folder the package lands in
+// instName — the package's own folder/file name inside destDir
+
+func installDestDir(parsed)
+{
+    if (parsed.kind == "official") { return MODULE_PATH }
+    return Path.join(MODULE_PATH, parsed.owner)
+}
+
+func installName(parsed)
+{
+    if (parsed.kind == "official") { return parsed.name }
+    return parsed.repo
+}
+
+func installFileZym(parsed)
+{
+    return Path.join(installDestDir(parsed), installName(parsed) + ".zym")
+}
+
+func installDirFull(parsed)
+{
+    return Path.join(installDestDir(parsed), installName(parsed))
+}
+
+// ---------------------------------------------------------------------------
+// zpk extraction
+// ---------------------------------------------------------------------------
+// Entries are packed with a generic "prefix/" root by modpack.
+// We strip that root and replace it with the real install name.
+
+func extractZpk(data, destDir, instName)
+{
+    var bundle = Pack.openBuffer(data)
+    if (bundle == null) { return { ok: false, error: "Downloaded file is not a valid .zpk" } }
+
+    var entries = bundle.list()
+    if (entries == null || length(entries) == 0) {
+        bundle.close()
+        return { ok: false, error: ".zpk contains no entries" }
+    }
+
+    if (!Dir.makeDirRecursive(destDir)) {
+        bundle.close()
+        return { ok: false, error: "Failed to create directory: " + destDir }
+    }
+
+    var PREFIX     = "prefix/"
+    var entryCount = length(entries)
+
+    for (var i = 0; i < entryCount; i++) {
+        var entry     = entries[i]
+        var entryName = entry.name
+        if (entryName == "") { entryName = "entry_" + str(i) }
+
+        if (startsWith(entryName, PREFIX)) {
+            entryName = instName + "/" + slice(entryName, length(PREFIX), length(entryName))
+        }
+
+        var entryData = bundle.open(i)
+        if (entryData == null) {
+            bundle.close()
+            return { ok: false, error: "Failed to read entry: " + entryName }
+        }
+
+        var outPath = Path.join(destDir, entryName)
+        var outDir  = Path.dirname(outPath)
+        if (outDir != destDir && outDir != "") { Dir.makeDirRecursive(outDir) }
+
+        if (!File.writeBytes(outPath, entryData)) {
+            bundle.close()
+            return { ok: false, error: "Failed to write: " + outPath }
+        }
+    }
+
+    bundle.close()
+    return { ok: true, count: entryCount }
+}
+
+func installPackage(spec, force)
+{
+    var parsed = parsePackageSpec(spec)
+    if (parsed.error != null) { print("Error: %v", parsed.error); return false }
+
+    var destDir  = installDestDir(parsed)
+    var instName = installName(parsed)
+    var fullDir  = installDirFull(parsed)
+    var fullFile = installFileZym(parsed)
+
+    if (Dir.exists(fullDir) || File.exists(fullFile)) {
+        if (!force) {
+            print("Error: Package '%v' is already installed. Use --force to overwrite.", parsed.name)
+            return false
+        }
+        print("  Force — removing existing install...")
+        if (Dir.exists(fullDir)) {
+            var d = Dir.open(fullDir)
+            if (d != null) { d.eraseContentsRecursive() }
+            Dir.remove(fullDir)
+        }
+        if (File.exists(fullFile)) { File.remove(fullFile) }
+    }
+
+    print("Installing '%v'...", parsed.name)
+
+    if (parsed.kind == "github" || parsed.kind == "gitlab") {
+        if (!Dir.exists(destDir)) { Dir.makeDirRecursive(destDir) }
+    }
+
+    var host = parsed.kind == "gitlab" ? RAW_GITLAB : RAW_GITHUB
+
+    func fetchPath(ref, filePath) {
+        if (parsed.kind == "gitlab") { return gitlabPath(parsed.owner, parsed.repo, ref, filePath) }
+        return githubPath(parsed.owner, parsed.repo, ref, filePath)
+    }
+
+    var candidates     = fetchCandidates(parsed)
+    var candidateCount = length(candidates)
+
+    for (var i = 0; i < candidateCount; i++) {
+        var c = candidates[i]
+
+        // Try dist/<name>.zpk
+        print("  Trying %v/%v/%v/%v...", parsed.owner, parsed.repo, c.ref, c.zpkPath)
+        var zpkRes = tlsGet(host, fetchPath(c.ref, c.zpkPath), 10000)
+        if (zpkRes.ok) {
+            if (!Dir.makeDirRecursive(destDir)) { print("Error: Failed to create directory: %v", destDir); return false }
+            print("  Extracting .zpk...")
+            var result = extractZpk(zpkRes.data, destDir, instName)
+            if (!result.ok) { print("Error: %v", result.error); return false }
+            print("OK: Installed '%v' (%v files) to %v", parsed.name, result.count, fullDir)
+            return true
+        }
+
+        // Try <name>.zym
+        print("  Trying %v/%v/%v/%v...", parsed.owner, parsed.repo, c.ref, c.zymPath)
+        var zymRes = tlsGet(host, fetchPath(c.ref, c.zymPath), 10000)
+        if (zymRes.ok) {
+            if (!File.writeBytes(fullFile, zymRes.data)) { print("Error: Failed to write %v", fullFile); return false }
+            print("OK: Installed '%v' (%v bytes) to %v", parsed.name, zymRes.data.size(), fullFile)
+            return true
+        }
+    }
+
+    print("Error: Package '%v' not found.", parsed.name)
+    return false
+}
+
+func uninstallPackage(spec)
+{
+    // Strip provider prefix and version tag — neither matters on disk
+    if (startsWith(spec, "github:")) { spec = slice(spec, length("github:"), length(spec)) }
+    if (startsWith(spec, "gitlab:")) { spec = slice(spec, length("gitlab:"), length(spec)) }
+    var atIdx = indexOf(spec, "@")
+    if (atIdx > -1) { spec = slice(spec, 0, atIdx) }
+
+    var parsed
+    var slashIdx = indexOf(spec, "/")
+    if (slashIdx > -1) {
+        var owner = slice(spec, 0, slashIdx)
+        var repo  = slice(spec, slashIdx + 1, length(spec))
+        if (length(owner) == 0 || length(repo) == 0) { print("Error: Invalid package name: '%v'", spec); return false }
+        parsed = { kind: "github", name: owner + "/" + repo, owner: owner, repo: repo }
+    } else {
+        if (contains(spec, ":")) { print("Error: Unknown package spec format: '%v'", spec); return false }
+        parsed = { kind: "official", name: spec, owner: ZYM_OWNER, repo: ZYM_REPO }
+    }
+
+    print("Uninstalling '%v'...", parsed.name)
+
+    var fullDir  = installDirFull(parsed)
+    var fullFile = installFileZym(parsed)
+
+    if (Dir.exists(fullDir)) {
+        var d = Dir.open(fullDir)
+        if (d == null) { print("Error: Cannot open directory: %v", fullDir); return false }
+        d.eraseContentsRecursive()
+        if (!Dir.remove(fullDir)) { print("Error: Failed to remove directory: %v", fullDir); return false }
+        print("OK: Uninstalled '%v' (removed %v)", parsed.name, fullDir)
+        cleanupOwnerDir(parsed)
+        return true
+    }
+
+    if (File.exists(fullFile)) {
+        if (!File.remove(fullFile)) { print("Error: Failed to remove file: %v", fullFile); return false }
+        print("OK: Uninstalled '%v' (removed %v)", parsed.name, fullFile)
+        cleanupOwnerDir(parsed)
+        return true
+    }
+
+    print("Error: Package '%v' is not installed.", parsed.name)
+    return false
+
+    func cleanupOwnerDir(parsed) {
+        if (parsed.kind != "github" && parsed.kind != "gitlab") { return null }
+        var ownerDir = Path.join(MODULE_PATH, parsed.owner)
+        if (!Dir.exists(ownerDir)) { return null }
+        if (length(Dir.files(ownerDir)) == 0 && length(Dir.directories(ownerDir)) == 0) {
+            Dir.remove(ownerDir)
+        }
+    }
+}
+
+func listInstalled()
+{
+    print("")
+    print("  Installed packages:")
+    print("  -------------------")
+
+    var found = false
+
+    // Official single file modules at root
+    var rootFiles = Dir.files(MODULE_PATH)
+    for (var i = 0; i < length(rootFiles); i++) {
+        var f = rootFiles[i]
+        if (Path.extension(f) == "zym") { print("  %v", Path.stem(f)); found = true }
+    }
+
+    // Official folder modules + third party namespaced packages
+    var rootDirs = Dir.directories(MODULE_PATH)
+    for (var i = 0; i < length(rootDirs); i++) {
+        var d       = rootDirs[i]
+        var dirPath = Path.join(MODULE_PATH, d)
+
+        // Direct folder module (official)
+        if (File.exists(Path.join(dirPath, "main.zym"))) {
+            print("  %v", d)
+            found = true
+            continue
+        }
+
+        // Namespace folder (third party) — single file modules
+        var subFiles = Dir.files(dirPath)
+        for (var j = 0; j < length(subFiles); j++) {
+            var f = subFiles[j]
+            if (Path.extension(f) == "zym") { print("  %v/%v", d, Path.stem(f)); found = true }
+        }
+
+        // Namespace folder (third party) — folder modules
+        var subDirs = Dir.directories(dirPath)
+        for (var j = 0; j < length(subDirs); j++) {
+            var sd = subDirs[j]
+            if (File.exists(Path.join(dirPath, sd, "main.zym"))) {
+                print("  %v/%v", d, sd)
+                found = true
+            }
+        }
+    }
+
+    if (!found) { print("  (none)") }
+    print("")
+}
+
+func cli(argv)
+{
+    RUNNING_BINARY_PATH     = argv[0]
+    RUNNING_BINARY_PLATFORM = (Path.extension(RUNNING_BINARY_PATH) == "exe") ? "WINDOWS" : "LINUX"
+    var args = [...argv]; shift(args)
+
+    if (length(args) == 0) { printUsage(); return null }
+
+    var cmd = shift(args)
+
+    if (cmd == "i" || cmd == "install") {
+        if (length(args) == 0) { print("Error: Install requires a package name."); return null }
+        var pkg   = shift(args)
+        var force = length(args) > 0 && args[0] == "--force"
+        installPackage(pkg, force)
+    } else if (cmd == "u" || cmd == "uninstall") {
+        if (length(args) == 0) { print("Error: Uninstall requires a package name."); return null }
+        uninstallPackage(shift(args))
+    } else if (cmd == "list" || cmd == "ls") {
+        listInstalled()
+    } else {
+        print("Error: Command not recognized '%v'.", cmd)
+        print("       Run 'zym pkg' for usage.")
+    }
+
+    return null
+}
+
+func printUsage()
+{
+    print("")
+    print("  ===================================================================")
+    print("  |                      ZYM PACKAGE MANAGER                        |")
+    print("  ===================================================================")
+    print("  |                                                                 |")
+    print("  |  zym pkg i, install <name>              Install official pkg    |")
+    print("  |  zym pkg i, install github:u/r          Install from GitHub     |")
+    print("  |  zym pkg i, install gitlab:u/r          Install from GitLab     |")
+    print("  |  zym pkg i, install github:u/r@tag      Install specific tag    |")
+    print("  |  zym pkg i, install <name> --force      Overwrite if installed  |")
+    print("  |  zym pkg u, uninstall <name>            Remove a package        |")
+    print("  |  zym pkg u, uninstall u/r               Remove third party pkg  |")
+    print("  |  zym pkg list, ls                       List installed pkgs     |")
+    print("  |                                                                 |")
+    print("  ===================================================================")
+    print("")
+}

@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Anatole DP
+
+var RUNNING_BINARY_PATH
+var RUNNING_BINARY_PLATFORM
+
+
+func collectFiles(dir, baseDir, results)
+{
+    var d = Dir.open(dir)
+    if (d == null) { return false }
+    d.setIncludeHidden(false)
+
+    var files = d.files()
+    var fileCount = length(files)
+    for (var i = 0; i < fileCount; i++) {
+        var f = files[i]
+        if (!startsWith(f, ".")) {
+            push(results, Path.join(dir, f))
+        }
+    }
+
+    var dirs = d.directories()
+    var dirCount = length(dirs)
+    for (var i = 0; i < dirCount; i++) {
+        var sub = dirs[i]
+        var isRoot = (dir == baseDir)
+        if (!startsWith(sub, ".") && !(isRoot && sub == "dist")) {
+            collectFiles(Path.join(dir, sub), baseDir, results)
+        }
+    }
+
+    return true
+}
+
+func buildEntries(files, moduleDir)
+{
+    var entries = []
+    var fileCount = length(files)
+    var isSingleFile = (fileCount == 1)
+
+    for (var i = 0; i < fileCount; i++) {
+        var absPath = files[i]
+        var rel = slice(absPath, length(moduleDir), length(absPath))
+
+        if (startsWith(rel, "/") || startsWith(rel, "\\")) {
+            rel = slice(rel, 1, length(rel))
+        }
+
+        // Single file modules get renamed to main.zym so import() finds them correctly
+        var entryName = isSingleFile ? "prefix/main.zym" : "prefix/" + rel
+
+        push(entries, {
+            name: entryName,
+            kind: "file",
+            path: absPath,
+            compression: true,
+            level: 19,
+        })
+    }
+
+    return entries
+}
+
+func listZpk(path)
+{
+    if (Path.extension(path) != "zpk") { print("Error: File must be a .zpk: '%v'", path); return null }
+    if (!File.exists(path)) { print("Error: File not found: '%v'", path); return null }
+
+    var bundle = Pack.openFile(path)
+    if (bundle == null) {
+        print("Error: Not a valid .zpk file: '%v'", path)
+        return null
+    }
+
+    var entries = bundle.list()
+    if (entries == null || length(entries) == 0) {
+        print("  (no entries)")
+        bundle.close()
+        return null
+    }
+
+    print("")
+    print("  %v", path)
+    print("  ----------------------------------------")
+
+    var entryCount = length(entries)
+    var totalSize = 0
+    for (var i = 0; i < entryCount; i++) {
+        var entry = entries[i]
+        var name = entry.name
+        if (name == "") { name = "<unnamed:" + str(i) + ">" }
+        var size = entry.size
+        totalSize = totalSize + size
+        print("  [%v]  %v  (%v bytes)", i, name, size)
+    }
+
+    print("  ----------------------------------------")
+    print("  %v entries, %v bytes total", entryCount, totalSize)
+    print("")
+
+    bundle.close()
+    return null
+}
+
+func cli(argv)
+{
+    RUNNING_BINARY_PATH = argv[0]
+    RUNNING_BINARY_PLATFORM = (Path.extension(RUNNING_BINARY_PATH) == "exe") ? "WINDOWS" : "LINUX"
+    var args = [...argv]; shift(args)
+    var argsLength = length(args)
+
+    var entryFolder = null
+    var outPath = null
+
+    var i = 0
+    while (i < argsLength) {
+        var arg = args[i]
+        if (arg == "ls" || arg == "list") {
+            i++
+            if (i >= argsLength) { print("Error: ls requires a .zpk file path."); return null }
+            listZpk(args[i])
+            return null
+        } else if (arg == "-o" || arg == "--output") {
+            i++
+            if (i >= argsLength) { print("Error: %v requires a path.", arg); return null }
+            outPath = args[i]
+        } else if (!startsWith(arg, "-")) {
+            if (Path.extension(arg) == "zpk") {
+                listZpk(Path.normalize(Path.join(Process.getCwd(), arg)))
+                return null
+            }
+            if (entryFolder != null) { print("Error: Multiple entry folders specified."); return null }
+            entryFolder = arg
+        } else {
+            print("Error: Unknown argument '%v'.", arg)
+            printUsage()
+            return null
+        }
+        i++
+    }
+
+    if (entryFolder == null) {
+        entryFolder = Process.getCwd()
+    } else {
+        entryFolder = Path.normalize(Path.join(Process.getCwd(), entryFolder))
+    }
+
+    if (!Dir.exists(entryFolder)) { print("Error: Entry folder does not exist: '%v'", entryFolder); return null }
+
+    var moduleName = Path.filename(entryFolder)
+    if (moduleName == "") {
+        moduleName = Path.filename(Path.dirname(entryFolder))
+    }
+
+    if (moduleName == "") { print("Error: Could not determine module name from folder."); return null }
+
+    if (outPath == null) {
+        var binDir = Path.join(entryFolder, "dist")
+        if (!Dir.exists(binDir)) {
+            if (!Dir.makeDirRecursive(binDir)) {
+                print("Error: Failed to create output directory: '%v'", binDir)
+                return null
+            }
+        }
+        outPath = Path.join(binDir, moduleName + ".zpk")
+    } else {
+        outPath = Path.normalize(Path.join(Process.getCwd(), outPath))
+    }
+
+    if (Path.extension(outPath) != "zpk") { print("Error: Output path must end in '.zpk': '%v'", outPath); return null }
+
+    var outDir = Path.dirname(outPath)
+    if (!Dir.exists(outDir)) {
+        if (!Dir.makeDirRecursive(outDir)) { print("Error: Output directory does not exist: '%v'", outDir); return null }
+    }
+
+    print("Packing module '%v'...", moduleName)
+    print("  Source : %v", entryFolder)
+    print("  Output : %v", outPath)
+
+    var files = []
+    if (!collectFiles(entryFolder, entryFolder, files)) { print("Error: Failed to read entry folder: '%v'", entryFolder); return null }
+
+    var fileCount = length(files)
+    if (fileCount == 0) { print("Error: No files found in '%v'", entryFolder); return null }
+    print("  Files  : %v", fileCount)
+
+    var entries = buildEntries(files, entryFolder)
+    var ok = Pack.build({
+        output: outPath,
+        compression: true,
+        level: 19,
+        entries: entries,
+    })
+
+    if (ok && File.exists(outPath)) {
+        print("OK: Wrote %v bytes to '%v'", File.size(outPath), outPath)
+    } else { print("Error: Failed to write output file: '%v'", outPath); return null }
+
+    return null
+}
+
+func printUsage()
+{
+    print("")
+    print("  ============================================================")
+    print("  |                     ZYM MODULE PACKER                    |")
+    print("  ============================================================")
+    print("  |                                                          |")
+    print("  |  zym modpack                      Pack current folder    |")
+    print("  |  zym modpack <folder>             Pack specific folder   |")
+    print("  |  zym modpack <folder> -o <out>    Set output .zpk path   |")
+    print("  |  zym modpack ls <file.zpk>        List contents of zpk   |")
+    print("  |                                                          |")
+    print("  |  Output defaults to dist/<foldername>.zpk                |")
+    print("  |  Hidden files and folders (.*) are never packed.         |")
+    print("  |  Internal structure is always prefixed as 'prefix/'      |")
+    print("  |                                                          |")
+    print("  ============================================================")
+    print("")
+}
