@@ -22,7 +22,8 @@ func encode(str)
         if (isAlpha || isDigit || isSafe) {
             result = result + Buffer.fromList([b]).toUtf8()
         } else {
-            result = result + "%" + Buffer.fromList([b]).hex().toUpperCase()
+            result = result + "%" + Buffer.fromList([b]).hex()
+            result = toUpperCase(result)
         }
     }
 
