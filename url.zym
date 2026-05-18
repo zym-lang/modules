@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Anatole DP
+
+// ---------------------------------------------------------------------------
+// Percent encoding / decoding
+// ---------------------------------------------------------------------------
+// Safe characters per RFC 3986 unreserved set: A-Z a-z 0-9 - _ . ~
+
+func encode(str)
+{
+    var bytes  = Buffer.fromString(str)
+    var result = ""
+    var count  = bytes.size()
+
+    for (var i = 0; i < count; i++) {
+        var b = bytes.get(i)
+
+        var isAlpha  = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        var isDigit  = (b >= 48 && b <= 57)
+        var isSafe   = (b == 45 || b == 95 || b == 46 || b == 126)  // - _ . ~
+
+        if (isAlpha || isDigit || isSafe) {
+            result = result + Buffer.fromList([b]).toUtf8()
+        } else {
+            result = result + "%" + Buffer.fromList([b]).hex().toUpperCase()
+        }
+    }
+
+    return result
+}
+
+func decode(str)
+{
+    var result = ""
+    var len    = length(str)
+    var i      = 0
+
+    while (i < len) {
+        var ch = slice(str, i, i + 1)
+
+        if (ch == "%" && i + 2 < len) {
+            var hex = slice(str, i + 1, i + 3)
+            var buf = Buffer.fromHex(hex)
+            if (buf != null) {
+                result = result + buf.toUtf8()
+                i = i + 3
+                continue
+            }
+        }
+
+        if (ch == "+") {
+            result = result + " "
+            i++
+            continue
+        }
+
+        result = result + ch
+        i++
+    }
+
+    return result
+}
+
+func parseQuery(queryStr)
+{
+    var params = {}
+    if (queryStr == "" || queryStr == null) { return params }
+
+    var pairs = split(queryStr, "&")
+    for (var i = 0; i < length(pairs); i++) {
+        var pair  = pairs[i]
+        var eqIdx = indexOf(pair, "=")
+        if (eqIdx > -1) {
+            var key = decode(slice(pair, 0, eqIdx))
+            var val = decode(slice(pair, eqIdx + 1, length(pair)))
+            params[key] = val
+        } else if (length(pair) > 0) {
+            params[decode(pair)] = ""
+        }
+    }
+
+    return params
+}
+
+func buildQuery(params)
+{
+    var result = ""
+    var ks     = keys(params)
+    for (var i = 0; i < length(ks); i++) {
+        var k = ks[i]
+        var v = params[k]
+        if (length(result) > 0) { result = result + "&" }
+        result = result + encode(k) + "=" + encode(str(v))
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// URL parsing
+// ---------------------------------------------------------------------------
+// Returns: { scheme, user, password, host, port, path, query, params, fragment, raw }
+// Missing parts are null. port is a number or null.
+
+func parse(url)
+{
+    var raw      = url
+    var scheme   = null
+    var user     = null
+    var password = null
+    var host     = null
+    var port     = null
+    var path     = null
+    var query    = null
+    var params   = {}
+    var fragment = null
+
+    // Fragment
+    var fragIdx = indexOf(url, "#")
+    if (fragIdx > -1) {
+        fragment = slice(url, fragIdx + 1, length(url))
+        url = slice(url, 0, fragIdx)
+    }
+
+    // Query
+    var queryIdx = indexOf(url, "?")
+    if (queryIdx > -1) {
+        query  = slice(url, queryIdx + 1, length(url))
+        params = parseQuery(query)
+        url    = slice(url, 0, queryIdx)
+    }
+
+    // Scheme
+    var schemeIdx = indexOf(url, "://")
+    if (schemeIdx > -1) {
+        scheme = slice(url, 0, schemeIdx)
+        url    = slice(url, schemeIdx + 3, length(url))
+    }
+
+    // Authority (user:pass@host:port) vs path
+    var slashIdx = indexOf(url, "/")
+    var authority
+    if (slashIdx > -1) {
+        authority = slice(url, 0, slashIdx)
+        path      = slice(url, slashIdx, length(url))
+    } else {
+        authority = url
+        path      = "/"
+    }
+
+    // User info
+    var atIdx = indexOf(authority, "@")
+    if (atIdx > -1) {
+        var userInfo  = slice(authority, 0, atIdx)
+        authority     = slice(authority, atIdx + 1, length(authority))
+        var colonIdx  = indexOf(userInfo, ":")
+        if (colonIdx > -1) {
+            user     = userInfo == "" ? null : slice(userInfo, 0, colonIdx)
+            password = slice(userInfo, colonIdx + 1, length(userInfo))
+        } else {
+            user = userInfo == "" ? null : userInfo
+        }
+    }
+
+    // Host and port
+    // Handle IPv6 [::1]:port
+    if (startsWith(authority, "[")) {
+        var closeBracket = indexOf(authority, "]")
+        if (closeBracket > -1) {
+            host = slice(authority, 1, closeBracket)
+            var afterBracket = slice(authority, closeBracket + 1, length(authority))
+            if (startsWith(afterBracket, ":")) {
+                var portStr = slice(afterBracket, 1, length(afterBracket))
+                if (length(portStr) > 0) { port = num(portStr) }
+            }
+        }
+    } else {
+        var colonIdx = indexOf(authority, ":")
+        if (colonIdx > -1) {
+            host = slice(authority, 0, colonIdx)
+            var portStr = slice(authority, colonIdx + 1, length(authority))
+            if (length(portStr) > 0) { port = num(portStr) }
+        } else {
+            host = authority == "" ? null : authority
+        }
+    }
+
+    // Default ports
+    if (port == null) {
+        if (scheme == "http")  { port = 80 }
+        if (scheme == "https") { port = 443 }
+        if (scheme == "ws")    { port = 80 }
+        if (scheme == "wss")   { port = 443 }
+        if (scheme == "ftp")   { port = 21 }
+    }
+
+    if (path == "") { path = "/" }
+
+    return {
+        scheme,
+        user,
+        password,
+        host,
+        port,
+        path,
+        query,
+        params,
+        fragment,
+        raw,
+    }
+}
+
+func build(parts)
+{
+    var result = ""
+
+    if (parts.scheme != null) { result = parts.scheme + "://" }
+
+    if (parts.user != null) {
+        result = result + encode(parts.user)
+        if (parts.password != null) { result = result + ":" + encode(parts.password) }
+        result = result + "@"
+    }
+
+    if (parts.host != null) { result = result + parts.host }
+
+    if (parts.port != null) {
+        var skipPort = (parts.scheme == "http"  && parts.port == 80)  ||
+                       (parts.scheme == "https" && parts.port == 443) ||
+                       (parts.scheme == "ws"    && parts.port == 80)  ||
+                       (parts.scheme == "wss"   && parts.port == 443) ||
+                       (parts.scheme == "ftp"   && parts.port == 21)
+        if (!skipPort) { result = result + ":" + str(parts.port) }
+    }
+
+    var path = parts.path != null ? parts.path : "/"
+    if (!startsWith(path, "/")) { path = "/" + path }
+    result = result + path
+
+    if (parts.params != null && size(parts.params) > 0) {
+        result = result + "?" + buildQuery(parts.params)
+    } else if (parts.query != null && parts.query != "") {
+        result = result + "?" + parts.query
+    }
+
+    if (parts.fragment != null && parts.fragment != "") {
+        result = result + "#" + parts.fragment
+    }
+
+    return result
+}
+
+func resolve(base, ref)
+{
+    if (contains(ref, "://")) { return ref }
+    var b = parse(base)
+    if (startsWith(ref, "/")) {
+        b.path     = ref
+        b.query    = null
+        b.params   = {}
+        b.fragment = null
+    } else {
+        var baseDir = Path.dirname(b.path)
+        b.path      = Path.normalize(baseDir + "/" + ref)
+        b.query     = null
+        b.params    = {}
+        b.fragment  = null
+    }
+    return build(b)
+}
+
+func origin(url)
+{
+    var p = parse(url)
+    return build({ scheme: p.scheme, host: p.host, port: p.port, path: "/" })
+}
+
+return { parse, build, encode, decode, parseQuery, buildQuery, resolve, origin }
