@@ -304,7 +304,6 @@ func installPackage(spec, force)
 
 func uninstallPackage(spec)
 {
-    // Strip provider prefix and version tag — neither matters on disk
     if (startsWith(spec, "github:")) { spec = slice(spec, length("github:"), length(spec)) }
     if (startsWith(spec, "gitlab:")) { spec = slice(spec, length("gitlab:"), length(spec)) }
     var atIdx = indexOf(spec, "@")

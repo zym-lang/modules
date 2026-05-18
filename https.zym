@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Anatole DP
+
+var url = import("url.zym")
+
+var DEFAULT_TIMEOUT      = 10000
+var DEFAULT_MAX_REDIRECTS = 5
+
+func fetch(urlStr, options, maxRedirects)
+{
+    var parsed = url.parse(urlStr)
+    if (parsed.host == null) { return { ok: false, status: 0, error: "Invalid URL: " + urlStr } }
+
+    var method         = "GET"
+    var headers        = {}
+    var body           = null
+    var contentType    = null
+    var timeout        = DEFAULT_TIMEOUT
+    var connectTimeout = DEFAULT_TIMEOUT
+
+    if (options != null) {
+        if (options.method         != null) { method         = options.method }
+        if (options.headers        != null) { merge(headers, options.headers) }
+        if (options.body           != null) { body           = options.body }
+        if (options.timeout        != null) { timeout        = options.timeout }
+        if (options.connectTimeout != null) { connectTimeout = options.connectTimeout }
+    }
+
+    var host = parsed.host
+    var port = parsed.port != null ? parsed.port : 443
+    var path = parsed.path != null ? parsed.path : "/"
+    if (parsed.query != null && parsed.query != "") { path = path + "?" + parsed.query }
+
+    var s = TLS.connect(host, port, connectTimeout)
+    if (s == null) { return { ok: false, status: 0, error: "Failed to connect to " + host + ":" + str(port) } }
+    if (s.status() != "connected") {
+        s.close()
+        return { ok: false, status: 0, error: "Connection not ready: " + s.status() }
+    }
+
+    var reqLines = method + " " + path + " HTTP/1.1\r\n"
+    reqLines = reqLines + "Host: " + host + "\r\n"
+    reqLines = reqLines + "User-Agent: zym-http\r\n"
+    reqLines = reqLines + "Accept: */*\r\n"
+    reqLines = reqLines + "Connection: close\r\n"
+
+    var ks = keys(headers)
+    for (var i = 0; i < length(ks); i++) {
+        reqLines = reqLines + ks[i] + ": " + headers[ks[i]] + "\r\n"
+    }
+
+    var bodyBuf = null
+    if (body != null) {
+        if (typeof(body) == "string") {
+            bodyBuf = Buffer.fromString(body)
+        } else {
+            bodyBuf = body
+        }
+        reqLines = reqLines + "Content-Length: " + str(bodyBuf.size()) + "\r\n"
+        if (contentType != null) { reqLines = reqLines + "Content-Type: " + contentType + "\r\n" }
+    }
+
+    reqLines = reqLines + "\r\n"
+
+    var writeStatus = s.write(Buffer.fromString(reqLines), timeout)
+    if (writeStatus != "ok") {
+        s.close()
+        return { ok: false, status: 0, error: "Failed to send request: " + writeStatus }
+    }
+
+    if (bodyBuf != null) {
+        writeStatus = s.write(bodyBuf, timeout)
+        if (writeStatus != "ok") {
+            s.close()
+            return { ok: false, status: 0, error: "Failed to send request body: " + writeStatus }
+        }
+    }
+
+    var statusLine = s.readLine(timeout)
+    if (typeof(statusLine) != "string") {
+        s.close()
+        return { ok: false, status: 0, error: "Failed to read status line" }
+    }
+
+    var statusCode = 0
+    var statusMsg  = ""
+    if (startsWith(statusLine, "HTTP/")) {
+        var parts = split(statusLine, " ")
+        if (length(parts) >= 2) { statusCode = num(parts[1]) }
+        if (length(parts) >= 3) { statusMsg  = join(slice(parts, 2, length(parts)), " ") }
+    }
+
+    var respHeaders    = {}
+    var contentLen     = -1
+    var isChunked      = false
+    var isGzip         = false
+    var isDeflate      = false
+
+    while (true) {
+        var line = s.readLine(timeout)
+        if (typeof(line) != "string" || line == "") { break }
+        var colonIdx = indexOf(line, ":")
+        if (colonIdx > -1) {
+            var k = toLowerCase(trim(slice(line, 0, colonIdx)))
+            var v = trim(slice(line, colonIdx + 1, length(line)))
+            respHeaders[k] = v
+            if (k == "content-length")   { contentLen = num(v) }
+            if (k == "transfer-encoding" && toLowerCase(v) == "chunked") { isChunked = true }
+            if (k == "content-encoding") {
+                var enc = toLowerCase(v)
+                if (enc == "gzip")    { isGzip    = true }
+                if (enc == "deflate") { isDeflate = true }
+            }
+        }
+    }
+
+    var bodyData = null
+
+    if (isChunked) {
+        bodyData = readChunked(s, timeout)
+    } else if (contentLen >= 0) {
+        if (contentLen == 0) {
+            bodyData = Buffer.new(0)
+        } else {
+            var result = s.read(contentLen, timeout)
+            if (typeof(result) == "string") {
+                s.close()
+                return { ok: false, status: statusCode, error: "Failed to read body: " + result }
+            }
+            bodyData = result
+        }
+    } else {
+        var result = s.readAll(timeout)
+        if (typeof(result) == "string") {
+            bodyData = Buffer.new(0)
+        } else {
+            bodyData = result
+        }
+    }
+
+    s.close()
+
+    if (bodyData == null) { bodyData = Buffer.new(0) }
+
+    if (isGzip && bodyData.size() > 0) {
+        var decompressed = bodyData.decompressDynamic("gzip")
+        if (decompressed != null) { bodyData = decompressed }
+    } else if (isDeflate && bodyData.size() > 0) {
+        var decompressed = bodyData.decompressDynamic("deflate")
+        if (decompressed != null) { bodyData = decompressed }
+    }
+
+    var respContentType = respHeaders["content-type"] != null ? toLowerCase(respHeaders["content-type"]) : ""
+
+    var data = null
+    if (contains(respContentType, "application/json")) {
+        data = JSON.parse(bodyData.toUtf8())
+    } else if (startsWith(respContentType, "text/")) {
+        data = bodyData.toUtf8()
+    }
+
+    var response = {
+        ok:      statusCode >= 200 && statusCode < 400,
+        status:  statusCode,
+        message: statusMsg,
+        headers: respHeaders,
+        body:    bodyData,
+    }
+
+    if (data != null) { response.data = data }
+
+    if ((statusCode == 301 || statusCode == 302 || statusCode == 303 ||
+         statusCode == 307 || statusCode == 308) && maxRedirects > 0) {
+        var location = respHeaders["location"]
+        if (location != null) {
+            if (!contains(location, "://")) {
+                location = url.resolve(urlStr, location)
+            }
+            if (statusCode == 303) {
+                options = { method: "GET", headers: headers, timeout: timeout }
+            }
+            return fetch(location, options, maxRedirects - 1)
+        }
+    }
+
+    return response
+
+    func readChunked(s, timeout) {
+        var result = Buffer.new(0)
+        while (true) {
+            var sizeLine = s.readLine(timeout)
+            if (typeof(sizeLine) != "string") { break }
+            sizeLine = trim(sizeLine)
+            // Strip chunk extensions
+            var semiIdx = indexOf(sizeLine, ";")
+            if (semiIdx > -1) { sizeLine = slice(sizeLine, 0, semiIdx) }
+            var chunkSize = 0
+            var hexBuf = Buffer.fromHex(length(sizeLine) % 2 == 0 ? sizeLine : "0" + sizeLine)
+            if (hexBuf != null) {
+                for (var i = 0; i < hexBuf.size(); i++) {
+                    chunkSize = chunkSize * 256 + hexBuf.get(i)
+                }
+            }
+            if (chunkSize == 0) { break }
+            var chunk = s.read(chunkSize, timeout)
+            if (typeof(chunk) != "string") { result = result.concat(chunk) }
+            s.readLine(timeout)  // trailing CRLF after chunk
+        }
+        return result
+    }
+}
+
+func fetch(urlStr, options)
+{
+    return fetch(urlStr, options, DEFAULT_MAX_REDIRECTS)
+}
+
+func get(urlStr)
+{
+    return fetch(urlStr, null)
+}
+
+func get(urlStr, headers)
+{
+    return fetch(urlStr, { method: "GET", headers: headers })
+}
+
+func post(urlStr, body, contentType)
+{
+    var ct = contentType != null ? contentType : "application/octet-stream"
+    return fetch(urlStr, {
+        method:  "POST",
+        headers: { "Content-Type": ct },
+        body:    body,
+    })
+}
+
+func put(urlStr, body, contentType)
+{
+    var ct = contentType != null ? contentType : "application/octet-stream"
+    return fetch(urlStr, {
+        method:  "PUT",
+        headers: { "Content-Type": ct },
+        body:    body,
+    })
+}
+
+func patch(urlStr, body, contentType)
+{
+    var ct = contentType != null ? contentType : "application/octet-stream"
+    return fetch(urlStr, {
+        method:  "PATCH",
+        headers: { "Content-Type": ct },
+        body:    body,
+    })
+}
+
+func del(urlStr)
+{
+    return fetch(urlStr, { method: "DELETE" })
+}
+
+func del(urlStr, headers)
+{
+    return fetch(urlStr, { method: "DELETE", headers: headers })
+}
+
+return { fetch, get, post, put, patch, del }
