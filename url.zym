@@ -23,7 +23,6 @@ func encode(str)
             result = result + Buffer.fromList([b]).toUtf8()
         } else {
             result = result + "%" + Buffer.fromList([b]).hex()
-            result = toUpperCase(result)
         }
     }
 
